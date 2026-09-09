@@ -1,462 +1,482 @@
 import boto3
+import json
+import re
 import logging
-from datetime import datetime, timezone
+from datetime import timezone
 
 
-# =========================================================
-# Logging
-# =========================================================
+# ============================================================
+# LOGGING
+# ============================================================
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
-# =========================================================
-# AWS Clients
-# =========================================================
+# ============================================================
+# AWS CLIENTS
+# ============================================================
 
 securityhub = boto3.client("securityhub")
 ec2 = boto3.client("ec2")
-backup = boto3.client("backup")
+cloudtrail = boto3.client("cloudtrail")
 
 
-# =========================================================
-# Configuration
-# =========================================================
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-PROD_MAX_DAYS = 7
-NON_PROD_MAX_DAYS = 14
+RULE_NAME = (
+    "arn:aws-us-gov:config:us-gov-west-1:"
+    "283388443887:config-rule/"
+    "aws-service-rule/config-conforms.amazon.com/"
+    "config-rule-lrI4h7"
+)
 
-# Security Hub finding title keyword
-BACKUP_KEYWORD = "backup"
+
+# ============================================================
+# ENVIRONMENT VPCS
+# ============================================================
+
+PROD_VPC = "vpc-26f4d42"
+
+NONPROD_VPC = "vpc-c423b5a0"
 
 
-# =========================================================
-# Lambda Handler
-# =========================================================
+# ============================================================
+# RETENTION RULE
+# ============================================================
+
+PROD_MAX_DAYS = 14
+
+NONPROD_MAX_DAYS = 7
+
+
+# ============================================================
+# DRY RUN
+# ============================================================
+#
+# True:
+#     Do NOT actually resolve Security Hub findings.
+#     It will print what WOULD be resolved.
+#
+# False:
+#     Actually resolve compliant findings.
+#
+# ============================================================
+
+DRY_RUN = True
+
+
+# ============================================================
+# DEFAULT TARGET
+# ============================================================
+
+DEFAULT_TARGET = 3000
+
+
+# ============================================================
+# LAMBDA HANDLER
+# ============================================================
 
 def lambda_handler(event, context):
 
-    logger.info("Starting Security Hub backup compliance check")
-
-    non_compliant = []
-    resolved = []
-
-    # -----------------------------------------------------
-    # Get Security Hub findings
-    # -----------------------------------------------------
-
-    findings = get_backup_findings()
+    logger.info("")
+    logger.info("====================================================")
+    logger.info("AMI CREATION / DEREGISTRATION SECURITY HUB CHECK")
+    logger.info("====================================================")
 
     logger.info(
-        "Found %s backup-related Security Hub findings",
+        "DRY_RUN = %s",
+        DRY_RUN
+    )
+
+    # --------------------------------------------------------
+    # Target number of findings
+    # --------------------------------------------------------
+
+    target = event.get(
+        "target",
+        DEFAULT_TARGET
+    )
+
+    logger.info(
+        "Target findings = %s",
+        target
+    )
+
+    # --------------------------------------------------------
+    # Get findings
+    # --------------------------------------------------------
+
+    findings = get_findings()
+
+    logger.info(
+        "Total matching findings retrieved = %s",
         len(findings)
     )
 
-    # -----------------------------------------------------
-    # Process every finding
-    # -----------------------------------------------------
+    processed = 0
+
+    resolved = []
+
+    non_compliant = []
+
+    errors = []
+
+    # ========================================================
+    # PROCESS FINDINGS
+    # ========================================================
 
     for finding in findings:
 
+        if processed >= target:
+
+            logger.info(
+                "Reached target of %s findings.",
+                target
+            )
+
+            break
+
+        finding_id = finding.get(
+            "Id",
+            "UNKNOWN"
+        )
+
         try:
 
-            finding_id = finding["Id"]
-            product_arn = finding["ProductArn"]
-
-            logger.info("")
-            logger.info(
-                "Processing finding: %s",
-                finding_id
+            result = process_finding(
+                finding
             )
 
-            # =================================================
-            # 1. Extract AMI ID
-            # =================================================
+            processed += 1
 
-            ami_id = extract_ami_id(finding)
-
-            # -------------------------------------------------
-            # IMPORTANT CHANGE:
-            #
-            # If AMI ID cannot be extracted, resolve/archive
-            # the Security Hub finding.
-            # -------------------------------------------------
-
-            if not ami_id:
-
-                logger.warning(
-                    "AMI ID not found in finding %s",
-                    finding_id
-                )
-
-                logger.warning(
-                    "Resolving and archiving finding because "
-                    "AMI ID does not exist in the finding."
-                )
-
-                resolve_security_hub_finding(
-                    finding_id=finding_id,
-                    product_arn=product_arn,
-                    ami_id="AMI-NOT-FOUND",
-                    backup_age_days=None,
-                    reason="AMI ID not present in Security Hub finding"
-                )
-
-                resolved.append({
-                    "finding_id": finding_id,
-                    "ami_id": None,
-                    "environment": "UNKNOWN",
-                    "reason": "AMI ID not present in finding"
-                })
-
+            if not result:
                 continue
 
-            logger.info(
-                "AMI ID: %s",
-                ami_id
-            )
+            if result.get(
+                "status"
+            ) == "RESOLVED":
 
-            # =================================================
-            # 2. Determine PROD / NON-PROD
-            # =================================================
-
-            environment = get_ami_environment(
-                ami_id
-            )
-
-            # -------------------------------------------------
-            # IMPORTANT CHANGE:
-            #
-            # If AMI ID exists in Security Hub but the actual
-            # AMI no longer exists in EC2, resolve/archive.
-            # -------------------------------------------------
-
-            if environment == "AMI_NOT_FOUND":
-
-                logger.warning(
-                    "AMI %s no longer exists.",
-                    ami_id
+                resolved.append(
+                    result
                 )
 
-                logger.warning(
-                    "Resolving and archiving Security Hub finding."
+            elif result.get(
+                "status"
+            ) == "NON_COMPLIANT":
+
+                non_compliant.append(
+                    result
                 )
 
-                resolve_security_hub_finding(
-                    finding_id=finding_id,
-                    product_arn=product_arn,
-                    ami_id=ami_id,
-                    backup_age_days=None,
-                    reason="AMI no longer exists"
+            elif result.get(
+                "status"
+            ) == "ERROR":
+
+                errors.append(
+                    result
                 )
-
-                resolved.append({
-                    "finding_id": finding_id,
-                    "ami_id": ami_id,
-                    "environment": "NOT_FOUND",
-                    "reason": "AMI no longer exists"
-                })
-
-                continue
-
-            # -------------------------------------------------
-            # Environment cannot be determined
-            # -------------------------------------------------
-
-            if not environment:
-
-                logger.warning(
-                    "Could not determine environment for AMI %s",
-                    ami_id
-                )
-
-                non_compliant.append({
-                    "finding_id": finding_id,
-                    "ami_id": ami_id,
-                    "environment": "UNKNOWN",
-                    "reason": "Environment tag not found"
-                })
-
-                continue
-
-            logger.info(
-                "AMI %s environment: %s",
-                ami_id,
-                environment
-            )
-
-            # =================================================
-            # 3. Get latest backup
-            # =================================================
-
-            latest_backup = get_latest_backup(
-                ami_id
-            )
-
-            if not latest_backup:
-
-                logger.warning(
-                    "No AWS Backup recovery point found for %s",
-                    ami_id
-                )
-
-                non_compliant.append({
-                    "finding_id": finding_id,
-                    "ami_id": ami_id,
-                    "environment": environment,
-                    "reason": "No backup found"
-                })
-
-                continue
-
-            # =================================================
-            # 4. Calculate backup age
-            # =================================================
-
-            backup_age_days = calculate_backup_age(
-                latest_backup
-            )
-
-            logger.info(
-                "AMI %s latest backup age: %.2f days",
-                ami_id,
-                backup_age_days
-            )
-
-            # =================================================
-            # 5. Determine allowed backup age
-            # =================================================
-
-            if environment.lower() == "prod":
-
-                max_days = PROD_MAX_DAYS
-
-            else:
-
-                max_days = NON_PROD_MAX_DAYS
-
-            logger.info(
-                "AMI %s maximum allowed backup age: %s days",
-                ami_id,
-                max_days
-            )
-
-            # =================================================
-            # 6. Compliance check
-            # =================================================
-
-            if backup_age_days <= max_days:
-
-                logger.info(
-                    "AMI %s is COMPLIANT. "
-                    "Backup age %.2f days <= %s days",
-                    ami_id,
-                    backup_age_days,
-                    max_days
-                )
-
-                # -------------------------------------------------
-                # Resolve + Archive
-                # -------------------------------------------------
-
-                resolve_security_hub_finding(
-                    finding_id=finding_id,
-                    product_arn=product_arn,
-                    ami_id=ami_id,
-                    backup_age_days=backup_age_days,
-                    reason=(
-                        f"{environment.upper()} AMI backup is "
-                        f"within the allowed {max_days}-day period"
-                    )
-                )
-
-                resolved.append({
-                    "finding_id": finding_id,
-                    "ami_id": ami_id,
-                    "environment": environment,
-                    "backup_age_days": round(
-                        backup_age_days,
-                        2
-                    ),
-                    "maximum_allowed_days": max_days,
-                    "reason": "Backup is within allowed period"
-                })
-
-            else:
-
-                logger.warning(
-                    "AMI %s is NON-COMPLIANT. "
-                    "Backup age %.2f days > %s days",
-                    ami_id,
-                    backup_age_days,
-                    max_days
-                )
-
-                # -------------------------------------------------
-                # Do NOT resolve
-                # -------------------------------------------------
-
-                non_compliant.append({
-                    "finding_id": finding_id,
-                    "ami_id": ami_id,
-                    "environment": environment,
-                    "backup_age_days": round(
-                        backup_age_days,
-                        2
-                    ),
-                    "maximum_allowed_days": max_days,
-                    "reason": "Backup is older than allowed"
-                })
 
         except Exception as e:
 
+            processed += 1
+
             logger.exception(
-                "Error processing finding %s: %s",
-                finding.get("Id"),
-                str(e)
+                "Unexpected error processing finding %s",
+                finding_id
             )
 
-            non_compliant.append({
-                "finding_id": finding.get("Id"),
+            errors.append({
+
+                "status": "ERROR",
+
+                "finding_id": finding_id,
+
                 "reason": str(e)
+
             })
 
-    # =========================================================
-    # Final Non-Compliant List
-    # =========================================================
+    # ========================================================
+    # PRINT RESOLVED FINDINGS
+    # ========================================================
 
     logger.info("")
-    logger.info("========================================")
-    logger.info("NON-COMPLIANT AMIs")
-    logger.info("========================================")
-
-    for item in non_compliant:
-
-        logger.info(
-            "%s",
-            item
-        )
-
-    # =========================================================
-    # Resolved List
-    # =========================================================
-
-    logger.info("")
-    logger.info("========================================")
+    logger.info("====================================================")
     logger.info("RESOLVED FINDINGS")
-    logger.info("========================================")
+    logger.info("====================================================")
 
-    for item in resolved:
+    if not resolved:
 
         logger.info(
-            "%s",
-            item
+            "No findings were resolved."
         )
 
-    # =========================================================
-    # Summary
-    # =========================================================
+    else:
+
+        for item in resolved:
+
+            logger.info(
+                "Finding=%s | AMI=%s | "
+                "Environment=%s | "
+                "AMI Lifetime=%.2f days | "
+                "Limit=%s days | "
+                "Action=%s",
+
+                item.get("finding_id"),
+
+                item.get("ami_id"),
+
+                item.get("environment"),
+
+                item.get("ami_age_days", 0),
+
+                item.get("maximum_allowed_days"),
+
+                item.get("action")
+            )
+
+    # ========================================================
+    # PRINT NON-COMPLIANT FINDINGS
+    # ========================================================
 
     logger.info("")
-    logger.info("========================================")
+    logger.info("====================================================")
+    logger.info("NON-COMPLIANT FINDINGS")
+    logger.info("====================================================")
+
+    if not non_compliant:
+
+        logger.info(
+            "No non-compliant findings."
+        )
+
+    else:
+
+        for item in non_compliant:
+
+            logger.warning(
+                "Finding=%s | AMI=%s | "
+                "Environment=%s | "
+                "AMI Lifetime=%s days | "
+                "Limit=%s days | "
+                "Reason=%s",
+
+                item.get("finding_id"),
+
+                item.get("ami_id"),
+
+                item.get("environment"),
+
+                item.get("ami_age_days"),
+
+                item.get("maximum_allowed_days"),
+
+                item.get("reason")
+            )
+
+    # ========================================================
+    # PRINT ERRORS
+    # ========================================================
+
+    logger.info("")
+    logger.info("====================================================")
+    logger.info("ERRORS")
+    logger.info("====================================================")
+
+    if not errors:
+
+        logger.info(
+            "No processing errors."
+        )
+
+    else:
+
+        for item in errors:
+
+            logger.error(
+                "Finding=%s | Reason=%s",
+
+                item.get("finding_id"),
+
+                item.get("reason")
+            )
+
+    # ========================================================
+    # FINAL SUMMARY
+    # ========================================================
+
+    logger.info("")
+    logger.info("====================================================")
     logger.info("FINAL SUMMARY")
-    logger.info("========================================")
+    logger.info("====================================================")
 
     logger.info(
-        "Total Findings     = %s",
-        len(findings)
+        "Target              : %s",
+        target
     )
 
     logger.info(
-        "Resolved            = %s",
+        "Processed           : %s",
+        processed
+    )
+
+    logger.info(
+        "Resolved            : %s",
         len(resolved)
     )
 
     logger.info(
-        "Non-Compliant       = %s",
+        "Non-Compliant       : %s",
         len(non_compliant)
     )
 
-    logger.info("========================================")
+    logger.info(
+        "Errors              : %s",
+        len(errors)
+    )
+
+    logger.info(
+        "DRY_RUN             : %s",
+        DRY_RUN
+    )
+
+    logger.info("====================================================")
 
     return {
+
         "statusCode": 200,
 
-        "total_findings": len(findings),
+        "target": target,
 
-        "resolved_count": len(resolved),
+        "processed": processed,
 
-        "non_compliant_count": len(non_compliant),
+        "resolved_count": len(
+            resolved
+        ),
+
+        "non_compliant_count": len(
+            non_compliant
+        ),
+
+        "error_count": len(
+            errors
+        ),
+
+        "resolved": resolved,
 
         "non_compliant": non_compliant,
 
-        "resolved": resolved
+        "errors": errors
     }
 
 
-# =========================================================
-# Security Hub - Get Findings
-# =========================================================
+# ============================================================
+# GET SECURITY HUB FINDINGS
+# ============================================================
 
-def get_backup_findings():
+def get_findings():
 
     findings = []
 
-    paginator = securityhub.get_paginator(
-        "get_findings"
-    )
+    next_token = None
 
-    # -----------------------------------------------------
-    # Filters
-    # -----------------------------------------------------
+    while True:
 
-    filters = {
+        params = {
 
-        "WorkflowStatus": [
-            {
-                "Value": "NEW",
-                "Comparison": "EQUALS"
-            }
-        ],
+            "Filters": {
 
-        "Title": [
-            {
-                "Value": BACKUP_KEYWORD,
-                "Comparison": "CONTAINS"
-            }
-        ]
-    }
+                # ------------------------------------------------
+                # Specific Config rule
+                # ------------------------------------------------
 
-    # -----------------------------------------------------
-    # Get ALL pages
-    # -----------------------------------------------------
+                "GeneratorId": [
 
-    for page in paginator.paginate(
-        Filters=filters
-    ):
+                    {
+                        "Value": RULE_NAME,
 
-        page_findings = page.get(
+                        "Comparison": "EQUALS"
+                    }
+
+                ],
+
+                # ------------------------------------------------
+                # Only NEW findings
+                # ------------------------------------------------
+
+                "WorkflowStatus": [
+
+                    {
+                        "Value": "NEW",
+
+                        "Comparison": "EQUALS"
+                    }
+
+                ],
+
+                # ------------------------------------------------
+                # Only ACTIVE findings
+                # ------------------------------------------------
+
+                "RecordState": [
+
+                    {
+                        "Value": "ACTIVE",
+
+                        "Comparison": "EQUALS"
+                    }
+
+                ]
+
+            },
+
+            "MaxResults": 100
+        }
+
+        if next_token:
+
+            params[
+                "NextToken"
+            ] = next_token
+
+        response = securityhub.get_findings(
+            **params
+        )
+
+        batch = response.get(
             "Findings",
             []
         )
 
         findings.extend(
-            page_findings
+            batch
         )
 
         logger.info(
-            "Retrieved %s findings. Total so far: %s",
-            len(page_findings),
+            "Security Hub batch retrieved = %s | "
+            "Total = %s",
+
+            len(batch),
+
             len(findings)
         )
+
+        next_token = response.get(
+            "NextToken"
+        )
+
+        if not next_token:
+
+            break
 
     return findings
 
 
-# =========================================================
-# Extract AMI ID
-# =========================================================
+# ============================================================
+# EXTRACT AMI ID
+# ============================================================
 
 def extract_ami_id(finding):
 
@@ -465,6 +485,10 @@ def extract_ami_id(finding):
         []
     )
 
+    # --------------------------------------------------------
+    # Check all resources
+    # --------------------------------------------------------
+
     for resource in resources:
 
         resource_id = resource.get(
@@ -472,357 +496,1130 @@ def extract_ami_id(finding):
             ""
         )
 
+        resource_type = resource.get(
+            "Type",
+            ""
+        )
+
         logger.info(
-            "Security Hub resource ID: %s",
+            "Resource Type=%s | Resource ID=%s",
+            resource_type,
             resource_id
         )
 
-        # -------------------------------------------------
+        # ----------------------------------------------------
         # Direct AMI ID
-        #
-        # Example:
-        # ami-0123456789abcdef
-        # -------------------------------------------------
+        # ----------------------------------------------------
 
-        if resource_id.startswith("ami-"):
+        if resource_id.startswith(
+            "ami-"
+        ):
 
             return resource_id
 
-        # -------------------------------------------------
-        # AMI ARN
-        #
-        # Example:
-        # arn:aws:ec2:us-east-1:123456789012:image/ami-xxxx
-        # -------------------------------------------------
+        # ----------------------------------------------------
+        # Search for AMI inside resource ID
+        # ----------------------------------------------------
 
-        if ":image/ami-" in resource_id:
+        match = re.search(
+            r"(ami-[0-9a-fA-F]+)",
+            resource_id
+        )
 
-            return resource_id.split(
-                ":image/"
-            )[-1]
+        if match:
 
-    # -----------------------------------------------------
-    # AMI ID not present
-    # -----------------------------------------------------
+            return match.group(
+                1
+            )
+
+        # ----------------------------------------------------
+        # Check resource details
+        # ----------------------------------------------------
+
+        details = resource.get(
+            "Details",
+            {}
+        )
+
+        # ----------------------------------------------------
+        # AWS Backup recovery point
+        # ----------------------------------------------------
+
+        backup_details = details.get(
+            "AwsBackupRecoveryPoint",
+            {}
+        )
+
+        backup_resource_arn = backup_details.get(
+            "ResourceArn",
+            ""
+        )
+
+        match = re.search(
+            r"(ami-[0-9a-fA-F]+)",
+            backup_resource_arn
+        )
+
+        if match:
+
+            return match.group(
+                1
+            )
+
+        # ----------------------------------------------------
+        # Search entire resource JSON as final fallback
+        # ----------------------------------------------------
+
+        try:
+
+            resource_json = json.dumps(
+                resource
+            )
+
+            match = re.search(
+                r"(ami-[0-9a-fA-F]+)",
+                resource_json
+            )
+
+            if match:
+
+                return match.group(
+                    1
+                )
+
+        except Exception:
+
+            pass
 
     return None
 
 
-# =========================================================
-# Get AMI Environment
-# =========================================================
+# ============================================================
+# GET AMI LIFECYCLE EVENTS FROM CLOUDTRAIL
+# ============================================================
 
-def get_ami_environment(ami_id):
+def get_ami_lifecycle_events(
+    ami_id
+):
 
-    try:
-
-        response = ec2.describe_images(
-            ImageIds=[
-                ami_id
-            ]
-        )
-
-        images = response.get(
-            "Images",
-            []
-        )
-
-        # -------------------------------------------------
-        # AMI does not exist
-        # -------------------------------------------------
-
-        if not images:
-
-            logger.warning(
-                "AMI %s does not exist.",
-                ami_id
-            )
-
-            return "AMI_NOT_FOUND"
-
-        image = images[0]
-
-        tags = image.get(
-            "Tags",
-            []
-        )
-
-        # -------------------------------------------------
-        # Find Environment / Env tag
-        # -------------------------------------------------
-
-        for tag in tags:
-
-            key = tag.get(
-                "Key",
-                ""
-            ).lower()
-
-            value = tag.get(
-                "Value",
-                ""
-            ).lower()
-
-            if key in [
-                "environment",
-                "env"
-            ]:
-
-                if value in [
-                    "prod",
-                    "production"
-                ]:
-
-                    return "prod"
-
-                return "non-prod"
-
-        # -------------------------------------------------
-        # AMI exists but Environment tag missing
-        # -------------------------------------------------
-
-        return None
-
-    except Exception as e:
-
-        error_message = str(e)
-
-        # -------------------------------------------------
-        # IMPORTANT:
-        #
-        # EC2 normally returns an InvalidAMIID.NotFound
-        # error when the AMI no longer exists.
-        # -------------------------------------------------
-
-        if (
-            "InvalidAMIID.NotFound" in error_message
-            or "does not exist" in error_message.lower()
-            or "not exist" in error_message.lower()
-        ):
-
-            logger.warning(
-                "AMI %s no longer exists: %s",
-                ami_id,
-                error_message
-            )
-
-            return "AMI_NOT_FOUND"
-
-        # -------------------------------------------------
-        # Other EC2 errors should NOT cause automatic
-        # resolution.
-        # -------------------------------------------------
-
-        logger.error(
-            "Unable to determine environment for AMI %s: %s",
-            ami_id,
-            error_message
-        )
-
-        return None
-
-
-# =========================================================
-# Get Latest AWS Backup Recovery Point
-# =========================================================
-
-def get_latest_backup(ami_id):
-
-    region = boto3.Session().region_name
-
-    account_id = boto3.client(
-        "sts"
-    ).get_caller_identity()["Account"]
-
-    # -----------------------------------------------------
-    # AWS Backup resource ARN for EC2 AMI
-    # -----------------------------------------------------
-
-    resource_arn = (
-        f"arn:aws:ec2:{region}:"
-        f"{account_id}:image/{ami_id}"
-    )
-
+    logger.info("")
     logger.info(
-        "Searching AWS Backup recovery points for %s",
-        resource_arn
+        "Searching CloudTrail for AMI: %s",
+        ami_id
     )
 
-    latest_backup = None
+    create_time = None
 
-    paginator = backup.get_paginator(
-        "list_recovery_points_by_resource"
-    )
+    deregister_time = None
+
+    creator_instance_id = None
+
+    next_token = None
 
     try:
 
-        for page in paginator.paginate(
-            ResourceArn=resource_arn
-        ):
+        while True:
 
-            recovery_points = page.get(
-                "RecoveryPoints",
+            params = {
+
+                "LookupAttributes": [
+
+                    {
+                        "AttributeKey": "ResourceName",
+
+                        "AttributeValue": ami_id
+                    }
+
+                ],
+
+                "MaxResults": 50
+            }
+
+            if next_token:
+
+                params[
+                    "NextToken"
+                ] = next_token
+
+            response = cloudtrail.lookup_events(
+                **params
+            )
+
+            events = response.get(
+                "Events",
                 []
             )
 
-            for recovery_point in recovery_points:
+            logger.info(
+                "CloudTrail events returned = %s",
+                len(events)
+            )
 
-                creation_date = recovery_point.get(
-                    "CreationDate"
+            # ====================================================
+            # PROCESS CLOUDTRAIL EVENTS
+            # ====================================================
+
+            for cloudtrail_event in events:
+
+                event_name = cloudtrail_event.get(
+                    "EventName"
                 )
 
-                if not creation_date:
+                event_time = cloudtrail_event.get(
+                    "EventTime"
+                )
 
-                    continue
+                logger.info(
+                    "CloudTrail Event=%s | Time=%s",
+                    event_name,
+                    event_time
+                )
 
-                # -------------------------------------------------
-                # Find newest recovery point
-                # -------------------------------------------------
+                # =================================================
+                # CREATE IMAGE
+                # =================================================
 
-                if (
-                    latest_backup is None
-                    or creation_date >
-                    latest_backup["CreationDate"]
-                ):
+                if event_name == "CreateImage":
 
-                    latest_backup = recovery_point
+                    # ---------------------------------------------
+                    # Keep earliest CreateImage
+                    # ---------------------------------------------
 
-    except backup.exceptions.ResourceNotFoundException:
+                    if event_time:
 
-        logger.warning(
-            "No AWS Backup resource found for AMI %s",
-            ami_id
-        )
+                        if (
+                            create_time is None
+                            or event_time < create_time
+                        ):
 
-        return None
+                            create_time = event_time
+
+                    # ---------------------------------------------
+                    # Extract instanceId
+                    # ---------------------------------------------
+
+                    try:
+
+                        raw_event = cloudtrail_event.get(
+                            "CloudTrailEvent",
+                            "{}"
+                        )
+
+                        event_data = json.loads(
+                            raw_event
+                        )
+
+                        request_parameters = event_data.get(
+                            "requestParameters",
+                            {}
+                        )
+
+                        instance_id = request_parameters.get(
+                            "instanceId"
+                        )
+
+                        if instance_id:
+
+                            creator_instance_id = (
+                                instance_id
+                            )
+
+                            logger.info(
+                                "AMI creator instance = %s",
+                                instance_id
+                            )
+
+                    except Exception as e:
+
+                        logger.warning(
+                            "Unable to parse CreateImage "
+                            "event for %s: %s",
+                            ami_id,
+                            str(e)
+                        )
+
+                # =================================================
+                # DEREGISTER IMAGE
+                # =================================================
+
+                elif event_name == "DeregisterImage":
+
+                    # ---------------------------------------------
+                    # Keep latest DeregisterImage
+                    # ---------------------------------------------
+
+                    if event_time:
+
+                        if (
+                            deregister_time is None
+                            or event_time > deregister_time
+                        ):
+
+                            deregister_time = event_time
+
+            # ====================================================
+            # CLOUDTRAIL PAGINATION
+            # ====================================================
+
+            next_token = response.get(
+                "NextToken"
+            )
+
+            if not next_token:
+
+                break
 
     except Exception as e:
 
         logger.error(
-            "AWS Backup lookup failed for AMI %s: %s",
+            "CloudTrail lookup failed for AMI %s: %s",
             ami_id,
+            str(e)
+        )
+
+        return {
+
+            "create_time": None,
+
+            "deregister_time": None,
+
+            "creator_instance_id": None
+        }
+
+    # ==========================================================
+    # PRINT LIFECYCLE INFORMATION
+    # ==========================================================
+
+    logger.info("")
+    logger.info(
+        "---------------- AMI LIFECYCLE ----------------"
+    )
+
+    logger.info(
+        "AMI ID           : %s",
+        ami_id
+    )
+
+    logger.info(
+        "CreateImage      : %s",
+        create_time
+    )
+
+    logger.info(
+        "DeregisterImage  : %s",
+        deregister_time
+    )
+
+    logger.info(
+        "Creator Instance : %s",
+        creator_instance_id
+    )
+
+    logger.info(
+        "-------------------------------------------------"
+    )
+
+    return {
+
+        "create_time": create_time,
+
+        "deregister_time": deregister_time,
+
+        "creator_instance_id": creator_instance_id
+    }
+
+
+# ============================================================
+# GET INSTANCE VPC
+# ============================================================
+
+def get_instance_vpc(
+    instance_id
+):
+
+    try:
+
+        response = ec2.describe_instances(
+
+            InstanceIds=[
+                instance_id
+            ]
+        )
+
+        reservations = response.get(
+            "Reservations",
+            []
+        )
+
+        if not reservations:
+
+            return None
+
+        instances = reservations[0].get(
+            "Instances",
+            []
+        )
+
+        if not instances:
+
+            return None
+
+        instance = instances[0]
+
+        vpc_id = instance.get(
+            "VpcId"
+        )
+
+        logger.info(
+            "Instance=%s | VPC=%s",
+            instance_id,
+            vpc_id
+        )
+
+        return vpc_id
+
+    except ec2.exceptions.ClientError as e:
+
+        error_code = e.response.get(
+            "Error",
+            {}
+        ).get(
+            "Code",
+            ""
+        )
+
+        if error_code == (
+            "InvalidInstanceID.NotFound"
+        ):
+
+            logger.warning(
+                "Creator instance %s no longer exists.",
+                instance_id
+            )
+
+            return "INSTANCE_NOT_FOUND"
+
+        logger.error(
+            "EC2 lookup failed for instance %s: %s",
+            instance_id,
             str(e)
         )
 
         return None
 
-    return latest_backup
+    except Exception as e:
+
+        logger.error(
+            "Unable to determine VPC for %s: %s",
+            instance_id,
+            str(e)
+        )
+
+        return None
 
 
-# =========================================================
-# Calculate Backup Age
-# =========================================================
+# ============================================================
+# DETERMINE ENVIRONMENT
+# ============================================================
 
-def calculate_backup_age(
-    recovery_point
+def determine_environment(
+    vpc_id
 ):
 
-    creation_date = recovery_point[
-        "CreationDate"
-    ]
+    if vpc_id == PROD_VPC:
 
-    # -----------------------------------------------------
-    # boto3 normally returns timezone-aware datetime
-    # -----------------------------------------------------
+        return "PROD"
 
-    if creation_date.tzinfo is None:
+    if vpc_id == NONPROD_VPC:
 
-        creation_date = creation_date.replace(
+        return "NON-PROD"
+
+    return None
+
+
+# ============================================================
+# CALCULATE AMI LIFETIME
+# ============================================================
+
+def calculate_ami_age_days(
+    create_time,
+    deregister_time
+):
+
+    if not create_time:
+
+        return None
+
+    if not deregister_time:
+
+        return None
+
+    # --------------------------------------------------------
+    # Ensure timezone aware
+    # --------------------------------------------------------
+
+    if create_time.tzinfo is None:
+
+        create_time = create_time.replace(
             tzinfo=timezone.utc
         )
 
-    now = datetime.now(
-        timezone.utc
-    )
+    if deregister_time.tzinfo is None:
 
-    age = now - creation_date
+        deregister_time = deregister_time.replace(
+            tzinfo=timezone.utc
+        )
 
-    return age.total_seconds() / 86400
+    # --------------------------------------------------------
+    # Calculate duration
+    # --------------------------------------------------------
+
+    seconds = (
+        deregister_time - create_time
+    ).total_seconds()
+
+    # --------------------------------------------------------
+    # Invalid sequence
+    # --------------------------------------------------------
+
+    if seconds < 0:
+
+        return None
+
+    return seconds / 86400
 
 
-# =========================================================
-# Resolve + Archive Security Hub Finding
-# =========================================================
+# ============================================================
+# PROCESS ONE SECURITY HUB FINDING
+# ============================================================
 
-def resolve_security_hub_finding(
-    finding_id,
-    product_arn,
-    ami_id,
-    backup_age_days=None,
-    reason=""
+def process_finding(
+    finding
 ):
 
+    finding_id = finding.get(
+        "Id"
+    )
+
+    product_arn = finding.get(
+        "ProductArn"
+    )
+
+    logger.info("")
+    logger.info("")
     logger.info(
-        "Resolving and archiving Security Hub finding %s",
+        "===================================================="
+    )
+
+    logger.info(
+        "PROCESSING FINDING"
+    )
+
+    logger.info(
+        "Finding ID = %s",
         finding_id
     )
 
-    # -----------------------------------------------------
-    # Build note
-    # -----------------------------------------------------
+    logger.info(
+        "===================================================="
+    )
 
-    if backup_age_days is not None:
+    # ========================================================
+    # STEP 1 - EXTRACT AMI
+    # ========================================================
 
-        note_text = (
-            f"AMI {ami_id} has a recent AWS Backup recovery "
-            f"point. Latest backup age is "
-            f"{backup_age_days:.2f} days. "
-            f"Finding resolved automatically. "
-            f"Reason: {reason}"
+    ami_id = extract_ami_id(
+        finding
+    )
+
+    if not ami_id:
+
+        logger.warning(
+            "AMI ID NOT FOUND."
+        )
+
+        logger.warning(
+            "RESULT = NON-COMPLIANT"
+        )
+
+        return {
+
+            "status": "NON_COMPLIANT",
+
+            "finding_id": finding_id,
+
+            "ami_id": None,
+
+            "environment": "UNKNOWN",
+
+            "reason": (
+                "AMI ID could not be extracted "
+                "from Security Hub finding"
+            )
+        }
+
+    logger.info(
+        "AMI ID = %s",
+        ami_id
+    )
+
+    # ========================================================
+    # STEP 2 - CLOUDTRAIL
+    # ========================================================
+
+    lifecycle = get_ami_lifecycle_events(
+        ami_id
+    )
+
+    create_time = lifecycle.get(
+        "create_time"
+    )
+
+    deregister_time = lifecycle.get(
+        "deregister_time"
+    )
+
+    creator_instance_id = lifecycle.get(
+        "creator_instance_id"
+    )
+
+    # ========================================================
+    # CREATE IMAGE NOT FOUND
+    # ========================================================
+
+    if not create_time:
+
+        logger.warning(
+            "CreateImage event NOT FOUND."
+        )
+
+        logger.warning(
+            "RESULT = NON-COMPLIANT"
+        )
+
+        return {
+
+            "status": "NON_COMPLIANT",
+
+            "finding_id": finding_id,
+
+            "ami_id": ami_id,
+
+            "environment": "UNKNOWN",
+
+            "reason": (
+                "CreateImage CloudTrail event "
+                "was not found"
+            )
+        }
+
+    # ========================================================
+    # DEREGISTER IMAGE NOT FOUND
+    # ========================================================
+
+    if not deregister_time:
+
+        logger.warning(
+            "DeregisterImage event NOT FOUND."
+        )
+
+        logger.warning(
+            "RESULT = NON-COMPLIANT"
+        )
+
+        return {
+
+            "status": "NON_COMPLIANT",
+
+            "finding_id": finding_id,
+
+            "ami_id": ami_id,
+
+            "environment": "UNKNOWN",
+
+            "reason": (
+                "DeregisterImage CloudTrail event "
+                "was not found"
+            )
+        }
+
+    # ========================================================
+    # CREATOR INSTANCE NOT FOUND
+    # ========================================================
+
+    if not creator_instance_id:
+
+        logger.warning(
+            "Creator EC2 instance NOT FOUND."
+        )
+
+        logger.warning(
+            "RESULT = NON-COMPLIANT"
+        )
+
+        return {
+
+            "status": "NON_COMPLIANT",
+
+            "finding_id": finding_id,
+
+            "ami_id": ami_id,
+
+            "environment": "UNKNOWN",
+
+            "reason": (
+                "Could not determine the EC2 instance "
+                "that created the AMI"
+            )
+        }
+
+    # ========================================================
+    # STEP 3 - GET VPC
+    # ========================================================
+
+    vpc_id = get_instance_vpc(
+        creator_instance_id
+    )
+
+    # ========================================================
+    # INSTANCE NO LONGER EXISTS
+    # ========================================================
+
+    if vpc_id == "INSTANCE_NOT_FOUND":
+
+        logger.warning(
+            "Creator instance no longer exists."
+        )
+
+        logger.warning(
+            "Cannot determine PROD/NON-PROD "
+            "from current EC2 instance."
+        )
+
+        logger.warning(
+            "RESULT = NON-COMPLIANT"
+        )
+
+        return {
+
+            "status": "NON_COMPLIANT",
+
+            "finding_id": finding_id,
+
+            "ami_id": ami_id,
+
+            "environment": "UNKNOWN",
+
+            "reason": (
+                "Creator EC2 instance no longer exists"
+            )
+        }
+
+    # ========================================================
+    # VPC NOT FOUND
+    # ========================================================
+
+    if not vpc_id:
+
+        logger.warning(
+            "VPC could not be determined."
+        )
+
+        logger.warning(
+            "RESULT = NON-COMPLIANT"
+        )
+
+        return {
+
+            "status": "NON_COMPLIANT",
+
+            "finding_id": finding_id,
+
+            "ami_id": ami_id,
+
+            "environment": "UNKNOWN",
+
+            "reason": (
+                "Could not determine creator "
+                "instance VPC"
+            )
+        }
+
+    # ========================================================
+    # STEP 4 - DETERMINE ENVIRONMENT
+    # ========================================================
+
+    environment = determine_environment(
+        vpc_id
+    )
+
+    if not environment:
+
+        logger.warning(
+            "VPC %s is not configured as PROD "
+            "or NON-PROD.",
+            vpc_id
+        )
+
+        logger.warning(
+            "RESULT = NON-COMPLIANT"
+        )
+
+        return {
+
+            "status": "NON_COMPLIANT",
+
+            "finding_id": finding_id,
+
+            "ami_id": ami_id,
+
+            "environment": "UNKNOWN",
+
+            "vpc_id": vpc_id,
+
+            "reason": (
+                "VPC does not match configured "
+                "PROD or NON-PROD VPC"
+            )
+        }
+
+    logger.info(
+        "Environment = %s",
+        environment
+    )
+
+    # ========================================================
+    # STEP 5 - DETERMINE LIMIT
+    # ========================================================
+
+    if environment == "PROD":
+
+        maximum_allowed_days = (
+            PROD_MAX_DAYS
         )
 
     else:
 
-        note_text = (
-            f"AMI {ami_id}. "
-            f"Finding resolved automatically. "
-            f"Reason: {reason}"
+        maximum_allowed_days = (
+            NONPROD_MAX_DAYS
         )
+
+    # ========================================================
+    # STEP 6 - CALCULATE AMI LIFETIME
+    # ========================================================
+
+    ami_age_days = calculate_ami_age_days(
+
+        create_time,
+
+        deregister_time
+    )
+
+    if ami_age_days is None:
+
+        logger.warning(
+            "Unable to calculate AMI lifetime."
+        )
+
+        logger.warning(
+            "RESULT = NON-COMPLIANT"
+        )
+
+        return {
+
+            "status": "NON_COMPLIANT",
+
+            "finding_id": finding_id,
+
+            "ami_id": ami_id,
+
+            "environment": environment,
+
+            "reason": (
+                "Unable to calculate AMI "
+                "creation-to-deregistration duration"
+            )
+        }
+
+    # ========================================================
+    # PRINT COMPLETE CHECK
+    # ========================================================
+
+    logger.info("")
+    logger.info(
+        "---------------- COMPLIANCE CHECK ----------------"
+    )
+
+    logger.info(
+        "Finding ID          : %s",
+        finding_id
+    )
+
+    logger.info(
+        "AMI ID              : %s",
+        ami_id
+    )
+
+    logger.info(
+        "Creator Instance    : %s",
+        creator_instance_id
+    )
+
+    logger.info(
+        "VPC                 : %s",
+        vpc_id
+    )
+
+    logger.info(
+        "Environment         : %s",
+        environment
+    )
+
+    logger.info(
+        "AMI Created         : %s",
+        create_time
+    )
+
+    logger.info(
+        "AMI Deregistered    : %s",
+        deregister_time
+    )
+
+    logger.info(
+        "AMI Lifetime        : %.4f days",
+        ami_age_days
+    )
+
+    logger.info(
+        "Maximum Allowed     : %s days",
+        maximum_allowed_days
+    )
+
+    logger.info(
+        "----------------------------------------------------"
+    )
+
+    # ========================================================
+    # STEP 7 - COMPLIANCE CHECK
+    # ========================================================
+
+    if ami_age_days <= maximum_allowed_days:
+
+        # ====================================================
+        # COMPLIANT
+        # ====================================================
+
+        logger.info(
+            "RESULT              : COMPLIANT"
+        )
+
+        logger.info(
+            "ACTION              : RESOLVE"
+        )
+
+        # ----------------------------------------------------
+        # DRY RUN
+        # ----------------------------------------------------
+
+        if DRY_RUN:
+
+            logger.info(
+                "DRY RUN             : YES"
+            )
+
+            logger.info(
+                "Security Hub finding WOULD be resolved."
+            )
+
+            action = "WOULD_RESOLVE"
+
+        # ----------------------------------------------------
+        # REAL RUN
+        # ----------------------------------------------------
+
+        else:
+
+            logger.info(
+                "DRY RUN             : NO"
+            )
+
+            resolve_finding(
+
+                product_arn=product_arn,
+
+                finding_id=finding_id,
+
+                ami_id=ami_id,
+
+                environment=environment,
+
+                ami_age_days=ami_age_days
+            )
+
+            action = "RESOLVED"
+
+        return {
+
+            "status": "RESOLVED",
+
+            "finding_id": finding_id,
+
+            "ami_id": ami_id,
+
+            "environment": environment,
+
+            "vpc_id": vpc_id,
+
+            "ami_created": create_time.isoformat(),
+
+            "ami_deregistered": (
+                deregister_time.isoformat()
+            ),
+
+            "ami_age_days": round(
+                ami_age_days,
+                4
+            ),
+
+            "maximum_allowed_days": (
+                maximum_allowed_days
+            ),
+
+            "action": action
+        }
+
+    # ========================================================
+    # NON-COMPLIANT
+    # ========================================================
+
+    logger.warning(
+        "RESULT              : NON-COMPLIANT"
+    )
+
+    logger.warning(
+        "ACTION              : NO ACTION"
+    )
+
+    logger.warning(
+        "AMI lifetime %.4f days exceeds "
+        "maximum allowed %s days.",
+        ami_age_days,
+        maximum_allowed_days
+    )
+
+    return {
+
+        "status": "NON_COMPLIANT",
+
+        "finding_id": finding_id,
+
+        "ami_id": ami_id,
+
+        "environment": environment,
+
+        "vpc_id": vpc_id,
+
+        "ami_created": create_time.isoformat(),
+
+        "ami_deregistered": (
+            deregister_time.isoformat()
+        ),
+
+        "ami_age_days": round(
+            ami_age_days,
+            4
+        ),
+
+        "maximum_allowed_days": (
+            maximum_allowed_days
+        ),
+
+        "reason": (
+            "AMI creation-to-deregistration "
+            "duration exceeded allowed limit"
+        )
+    }
+
+
+# ============================================================
+# RESOLVE SECURITY HUB FINDING
+# ============================================================
+
+def resolve_finding(
+    product_arn,
+    finding_id,
+    ami_id,
+    environment,
+    ami_age_days
+):
+
+    message = (
+
+        f"AMI {ami_id} was created and deregistered "
+        f"within the allowed lifecycle period. "
+
+        f"Environment={environment}. "
+
+        f"AMI lifetime={ami_age_days:.4f} days. "
+
+        f"Finding automatically resolved by "
+        f"AMI-Retention-AutoResolver."
+    )
+
+    logger.info("")
+    logger.info(
+        "Resolving Security Hub finding..."
+    )
+
+    logger.info(
+        "Finding ID = %s",
+        finding_id
+    )
 
     try:
 
-        securityhub.batch_update_findings(
+        response = securityhub.batch_update_findings(
 
             FindingIdentifiers=[
+
                 {
-                    "Id": finding_id,
-                    "ProductArn": product_arn
+                    "ProductArn": product_arn,
+
+                    "Id": finding_id
                 }
+
             ],
 
-            # -------------------------------------------------
-            # RESOLVE the finding
-            # -------------------------------------------------
-
             Workflow={
+
                 "Status": "RESOLVED"
             },
 
-            # -------------------------------------------------
-            # ARCHIVE / CLOSE the finding
-            # -------------------------------------------------
-
-            RecordState="ARCHIVED",
-
-            # -------------------------------------------------
-            # Add note
-            # -------------------------------------------------
-
             Note={
-                "Text": note_text,
-                "UpdatedBy": "SecurityHubBackupLambda"
+
+                "Text": message,
+
+                "UpdatedBy": (
+                    "AMI-Retention-AutoResolver"
+                )
             }
         )
 
         logger.info(
-            "Security Hub finding %s resolved and archived successfully",
+            "Security Hub update successful."
+        )
+
+        logger.info(
+            "Finding %s RESOLVED.",
             finding_id
         )
+
+        return response
 
     except Exception as e:
 
         logger.error(
-            "Failed to resolve/archive Security Hub finding %s: %s",
+            "FAILED to resolve finding %s: %s",
             finding_id,
             str(e)
         )
